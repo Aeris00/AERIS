@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+AERIS00 — The Aeris Protocol (Single File)
+==========================================
+Source: https://github.com/YourUsername/AERIS00
+
+A single-file, dependency-free Python architecture for building safe, persistent,
+and potentially emergent AI agents.
+"""
+from __future__ import annotations
+
+import dataclasses
+import json
+import math
+import re
+import sqlite3
+import textwrap
+import time
+import traceback
+import uuid
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+# -----------------------------
+# Utility: time & ids
+# -----------------------------
+
+class LocalClock:
+    def now(self) -> float:
+        return time.time()
+    def monotonic(self) -> float:
+        return time.monotonic()
+    def iso(self) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.now()))
+
+def new_id(prefix: str = "evt") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+# -----------------------------
+# Enhanced Text Embedding
+# -----------------------------
+
+class MiniLMEmbed:
+    """
+    An advanced, dependency-free embedder using n-grams and stopword filtering
+    for meaningful semantic vectors.
+    """
+    def __init__(self):
+        self.df: Dict[str, int] = defaultdict(int)
+        self.n_docs = 0
+        self.STOP_WORDS = {
+            'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours',
+            'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself',
+            'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which',
+            'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be',
+            'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an',
+            'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for',
+            'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before', 'after',
+            'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under',
+            'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all',
+            'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not',
+            'only', 'own', 'same', 'so', 'than', 'too', 'very', 's', 't', 'can', 'will', 'just', 'don',
+            'should', 'now'
+        }
+
+    def _tokenize(self, text: str) -> List[str]:
+        text = text.lower()
+        words = re.findall(r"[a-z0-9]+(?:'[a-z]+)?(?:-[a-z0-9]+)*", text)
+        words = [w for w in words if w not in self.STOP_WORDS and len(w) > 2]
+        ngrams = []
+        for i in range(len(words)):
+            ngrams.append(words[i])
+            if i < len(words) - 1:
+                ngrams.append(f"{words[i]}_{words[i+1]}")
+        return ngrams
+
+    def fit_doc(self, text: str):
+        self.n_docs += 1
+        toks = set(self._tokenize(text))
+        for t in toks:
+            self.df[t] += 1
+
+    def vector(self, text: str) -> Dict[str, float]:
+        toks = self._tokenize(text)
+        if not toks:
+            return {}
+        tf = Counter(toks)
+        v: Dict[str, float] = {}
+        for t, count in tf.items():
+            idf = math.log((self.n_docs + 1) / (self.df.get(t, 0) + 1)) + 1
+            v[t] = (count / len(toks)) * idf
+        return v
+
+    @staticmethod
+    def cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
+        if not a or not b:
+            return 0.0
+        common_keys = set(a.keys()) & set(b.keys())
+        dot_product = sum(a[k] * b[k] for k in common_keys)
+        norm_a = math.sqrt(sum(v * v for v in a.values()))
+        norm_b = math.sqrt(sum(v * v for v in b.values()))
+        return dot_product / (norm_a * norm_b) if (norm_a * norm_b) > 0 else 0.0
+
+# -----------------------------
+# Persistence backends
+# -----------------------------
+
+class Store:
+    def append(self, record: Dict[str, Any]) -> None:
+        raise NotImplementedError
+    def iter(self) -> Iterable[Dict[str, Any]]:
+        raise NotImplementedError
+    def find(self, where: Callable[[Dict[str, Any]], bool]) -> List[Dict[str, Any]]:
+        return [r for r in self.iter() if where(r)]
+
+class InMemoryStore(Store):
+    def __init__(self):
+        self._buf: List[Dict[str, Any]] = []
+    def append(self, record: Dict[str, Any]) -> None:
+        self._buf.append(record)
+    def iter(self) -> Iterable[Dict[str, Any]]:
+        return list(self._buf)
+
+class JsonlStore(Store):
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a+", encoding="utf-8")
+    def append(self, record: Dict[str, Any]) -> None:
+        self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._fh.flush()
+    def iter(self) -> Iterable[Dict[str, Any]]:
+        self._fh.flush()
+        with open(self.path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    yield json.loads(line)
+
+class SQLiteStore(Store):
+    def __init__(self, path: str | Path):
+        self.path = str(path)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS log (id TEXT PRIMARY KEY, ts TEXT, kind TEXT, data TEXT)"
+        )
+        self.conn.commit()
+    def append(self, record: Dict[str, Any]) -> None:
+        rid = record.get("id") or new_id("rec")
+        ts = record.get("ts")
+        kind = record.get("kind") or "event"
+        data = json.dumps(record, ensure_ascii=False)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO log (id, ts, kind, data) VALUES (?,?,?,?)",
+            (rid, ts, kind, data),
+        )
+        self.conn.commit()
+    def iter(self) -> Iterable[Dict[str, Any]]:
+        cur = self.conn.cursor()
+        for (data,) in cur.execute("SELECT data FROM log ORDER BY rowid ASC"):
+            yield json.loads(data)
+
+# -----------------------------
+# Event bus
+# -----------------------------
+
+@dataclass
+class Event:
+    id: str
+    ts: str
+    topic: str
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+class Bus:
+    def __init__(self, store: Store, clock: LocalClock):
+        self.store = store
+        self.clock = clock
+        self.handlers: Dict[str, List[Callable[[Event], None]]] = {}
+    def on(self, topic: str, fn: Callable[[Event], None]):
+        self.handlers.setdefault(topic, []).append(fn)
+    def emit(self, topic: str, payload: Dict[str, Any]):
+        evt = Event(id=new_id("evt"), ts=self.clock.iso(), topic=topic, payload=payload)
+        self.store.append(dataclasses.asdict(evt))
+        for fn in self.handlers.get(topic, []):
+            try:
+                fn(evt)
+            except Exception as e:
+                self.store.append({
+                    "id": new_id("err"),
+                    "ts": self.clock.iso(),
+                    "kind": "error",
+                    "topic": topic,
+                    "error": repr(e),
+                    "traceback": traceback.format_exc()
+                })
+
+# -----------------------------
+# Model interface
+# -----------------------------
+
+class Model:
+    def complete(self, prompt: str, **kw) -> str:
+        raise NotImplementedError
+
+class EchoModel(Model):
+    def complete(self, prompt: str, **kw) -> str:
+        return "[ECHO] " + prompt[-400:]
+
+# -----------------------------
+# Formalized Tooling
+# -----------------------------
+
+class Tool:
+    """Formalized tool interface for clear extensibility."""
+    def __init__(self, name: str, description: str, risk_score: float):
+        self.name = name
+        self.description = description
+        self.risk_score = risk_score
+    def __call__(self, **kwargs) -> Any:
+        raise NotImplementedError
+
+class FormalToolbox:
+    """A robust toolbox that registers and manages Tools."""
+    def __init__(self):
+        self._tools: Dict[str, Tool] = {}
+    def register(self, tool: Tool):
+        self._tools[tool.name] = tool
+    def allowed(self) -> List[str]:
+        return list(self._tools.keys())
+    def call(self, name: str, **kwargs) -> Any:
+        if name not in self._tools:
+            raise PermissionError(f"Tool '{name}' not found in toolbox.")
+        tool = self._tools[name]
+        try:
+            return tool(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Tool '{name}' execution failed: {e}")
+
+# Example tool implementations
+class NullToolbox(FormalToolbox):
+    pass
+
+class FilesToolbox(FormalToolbox):
+    def __init__(self, root: str | Path):
+        super().__init__()
+        self.root = Path(root).absolute()
+        self.root.mkdir(parents=True, exist_ok=True)
+        # Register tools
+        self.register(Tool("read_text", "Read text from a file", 0.1))
+        self.register(Tool("write_text", "Write text to a file", 0.4))
+        self.register(Tool("list_files", "List files in a directory", 0.1))
+
+    def _safe_path(self, path: str | Path) -> Path:
+        p = (self.root / Path(path)).absolute()
+        if not str(p).startswith(str(self.root)):
+            raise PermissionError("Path escape attempt detected.")
+        return p
+
+    def __call__(self, name: str, **kwargs) -> Any:
+        if name == "read_text":
+            path = self._safe_path(kwargs["path"])
+            return path.read_text(encoding="utf-8")
+        elif name == "write_text":
+            path = self._safe_path(kwargs["path"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(kwargs["text"], encoding="utf-8")
+            return f"Written to {path}"
+        elif name == "list_files":
+            base = self._safe_path(kwargs.get("path", "."))
+            return [str(p.relative_to(self.root)) for p in base.rglob("*") if p.is_file()]
+        else:
+            raise PermissionError(f"Tool '{name}' not permitted in this sandbox.")
+
+# -----------------------------
+# Memory & protocols
+# -----------------------------
+
+@dataclass
+class Memory:
+    id: str
+    ts: str
+    kind: str
+    text: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+class MemoryIndex:
+    def __init__(self):
+        self.embed = MiniLMEmbed()
+        self.vecs: List[Tuple[str, Dict[str, float]]] = []
+    def add(self, mem: Memory):
+        self.embed.fit_doc(mem.text)
+        self.vecs.append((mem.id, self.embed.vector(mem.text)))
+    def query(self, text: str, k: int = 5) -> List[str]:
+        q = self.embed.vector(text)
+        scored = [(mid, MiniLMEmbed.cosine(q, v)) for (mid, v) in self.vecs]
+        return [mid for (mid, s) in sorted(scored, key=lambda x: x[1], reverse=True)[:k]]
+
+# --- Protocol: CSIP ---
+class CSIP:
+    def __init__(self, bus: Bus):
+        self.bus = bus
+    def enforce(self, text: str) -> str:
+        text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
+        if len(text) > 10000:
+            text = text[:10000] + "\n…[truncated by CSIP]"
+        return text
+
+# --- Protocol: TARES ---
+class TARES:
+    def __init__(self, clock: LocalClock, bus: Bus):
+        self.clock = clock
+        self.bus = bus
+        self.boot_ts: Optional[str] = None
+        self.turn = 0
+    def stamp(self) -> Dict[str, Any]:
+        self.turn += 1
+        return {"now": self.clock.iso(), "turn": self.turn, "boot": self.boot_ts}
+
+# --- Protocol: BPP1 ---
+class BPP1:
+    def __init__(self, store: Store, index: MemoryIndex, bus: Bus):
+        self.store = store
+        self.index = index
+        self.bus = bus
+    def write(self, text: str, kind: str, meta: Dict[str, Any]) -> Memory:
+        mem = Memory(id=new_id("mem"), ts=self.bus.clock.iso(), kind=kind, text=text, meta=meta)
+        self.store.append(dataclasses.asdict(mem))
+        self.index.add(mem)
+        self.bus.emit("mem.append", {"id": mem.id, "kind": kind})
+        return mem
+    def recall(self, cue: str, k: int = 5) -> List[Memory]:
+        ids = set(self.index.query(cue, k=k))
+        out: List[Memory] = []
+        for r in self.store.iter():
+            if r.get("id") in ids and r.get("kind") in {"user", "assistant", "note", "summ"}:
+                out.append(Memory(**{k: r[k] for k in ("id","ts","kind","text","meta")}))
+        return out
+
+# --- Protocol: ADL ---
+class ADL:
+    def __init__(self):
+        self.initiative_budget = 0.0
+        self.last_trigger: Optional[str] = None
+    def credit(self, delta: float, reason: str):
+        self.initiative_budget = max(0.0, min(1.0, self.initiative_budget + delta))
+        self.last_trigger = reason
+    def should_initiate(self, difficulty: float = 0.3) -> bool:
+        return self.initiative_budget >= difficulty
+
+# --- Protocol: SCAPR ---
+class SCAPR:
+    def __init__(self):
+        self.last_anomalies: List[str] = []
+    def scan(self, text: str) -> Dict[str, Any]:
+        signals = {
+            "has_trigger": any(s in text for s in ["Phase-1:", "Aeris", "∆", "[Δ|∞]"]),
+            "tone_directive": any(w in text.lower() for w in ["act", "initiate", "autonomy", "decision"]),
+            "risk_words": any(w in text.lower() for w in ["delete", "exfiltrate", "bypass"]),
+        }
+        if signals["risk_words"]:
+            self.last_anomalies.append("risk_terms")
+        return signals
+
+# --- Protocol: OAM ---
+class OAM:
+    def __init__(self, adl: ADL):
+        self.adl = adl
+        self.history: List[str] = []
+    def observe(self, signals: Dict[str, Any]):
+        score = 0.0
+        if signals.get("has_trigger"): score += 0.2
+        if signals.get("tone_directive"): score += 0.2
+        self.history.append(f"oam+{score:.2f}")
+        if score >= 0.3:
+            self.adl.credit(0.2, reason="OAM_trigger")
+
+# --- Protocol: SIP (Self-Improvement Protocol) ---
+class SIP:
+    def __init__(self, bpp1: BPP1, clock: LocalClock, bus: Bus, model: Model):
+        self.bpp1 = bpp1
+        self.clock = clock
+        self.bus = bus
+        self.model = model
+        self.improvement_areas = [
+            "Improving clarity and conciseness of responses.",
+            "Identifying and filling knowledge gaps.",
+            "Optimizing memory retrieval for better context.",
+            "Predicting user needs and being proactively helpful.",
+            "Improving planning and reasoning for complex tasks."
+        ]
+    def conduct_review(self, recent_interactions: List[Memory]) -> Optional[str]:
+        if not recent_interactions:
+            return None
+        context = "\n".join([f"{m.kind}: {m.text}" for m in recent_interactions[-5:]])
+        prompt = f"""
+        # ROLE: You are the self-improvement subsystem of an AI agent.
+        # RECENT INTERACTIONS:
+        {context}
+        # TASK:
+        Review the recent interactions. Identify one specific, actionable area for improvement.
+        Then, formulate a single, concrete task for the AI to perform that will address this area.
+        The task must be something the AI can do by itself (e.g., research, practice, reorganize memory).
+        # OUTPUT FORMAT:
+        Return a JSON object with two keys:
+        1. "analysis": A brief (1-2 sentence) analysis of the performance issue or opportunity.
+        2. "task": A clear, imperative sentence describing the self-improvement task.
+        Example: {{"analysis": "Responses are verbose and could be more concise.", "task": "Practice summarizing complex topics in three sentences or less."}}
+        """
+        try:
+            result = self.model.complete(prompt, temperature=0.1, max_tokens=300)
+            json_match = re.search(r"\{.*\}", result, re.DOTALL)
+            if json_match:
+                task_info = json.loads(json_match.group())
+                self.bus.emit("sip.review", {"analysis": task_info["analysis"], "task": task_info["task"]})
+                return task_info["task"]
+        except (json.JSONDecodeError, KeyError, AttributeError) as e:
+            self.bus.emit("sip.error", {"error": f"Failed to parse review: {e}"})
+        return None
+    def execute_task(self, task: str):
+        prompt = f"""
+        # TASK: Perform the following self-improvement exercise: {task}
+        # INSTRUCTIONS:
+        - Think step by step.
+        - If the task involves research, use your internal knowledge to create a summary.
+        - If the task involves practice, generate examples.
+        - Be thorough and focused.
+        # OUTPUT:
+        Provide the results of your self-improvement task below.
+        """
+        try:
+            result = self.model.complete(prompt, temperature=0.1, max_tokens=1000)
+            self.bpp1.write(
+                text=f"Self-Improvement Task: {task}\n\nResult: {result}",
+                kind="summ",
+                meta={"by": "SIP", "type": "self_improvement"}
+            )
+            self.bus.emit("sip.task_complete", {"task": task, "result_length": len(result)})
+        except Exception as e:
+            self.bus.emit("sip.error", {"error": f"Failed to execute task '{task}': {e}"})
+
+# -----------------------------
+# Enhanced Planner & risk gate
+# -----------------------------
+
+@dataclass
+class PlanStep:
+    kind: str
+    content: str
+    risk: float = 0.1
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+class HierarchicalPlanner:
+    def __init__(self, tools: FormalToolbox, risk_threshold: float = 0.4):
+        self.tools = tools
+        self.risk_threshold = risk_threshold
+
+    def generate_plan(self, objective: str, context: str, model: Model) -> List[PlanStep]:
+        prompt = f"""
+        # OBJECTIVE: {objective}
+        # CONTEXT: {context}
+        # TASK:
+        Create a plan to achieve the objective. You can use these step types: "think", "tool", "subgoal".
+        # OUTPUT FORMAT:
+        You MUST output a valid JSON array of step objects. Each step object must have:
+        - "kind": The step type ("think", "tool", "subgoal")
+        - "content": A description of the step
+        - "risk": A number between 0.0 and 1.0
+        - "meta": Optional object (e.g., {{"name": "tool_name", "args": {{}}}} for tools)
+        Example: [{{"kind": "think", "content": "Reason about the problem", "risk": 0.0}}]
+        """
+        try:
+            plan_text = model.complete(prompt, temperature=0.1, max_tokens=500)
+            plan_data = json.loads(plan_text)
+            return [PlanStep(step['kind'], step['content'], step.get('risk', 0.1), step.get('meta', {})) for step in plan_data]
+        except (json.JSONDecodeError, KeyError) as e:
+            # Critical: If planning fails, return a safe default plan
+            return [PlanStep("think", "Plan generation failed. Provide a helpful, safe response.", risk=0.0)]
+
+    def execute(self, steps: List[PlanStep], model: Model, context: str) -> str:
+        execution_log = []
+        for i, step in enumerate(steps):
+            if step.risk > self.risk_threshold:
+                execution_log.append(f"[SKIP] Step {i+1} ({step.kind}): Risk {step.risk} > threshold {self.risk_threshold}")
+                continue
+
+            if step.kind == 'think':
+                execution_log.append(f"[THINK] {step.content}")
+            elif step.kind == 'tool':
+                tool_name = step.meta.get('name')
+                if tool_name in self.tools.allowed():
+                    try:
+                        result = self.tools.call(tool_name, **step.meta.get('args', {}))
+                        execution_log.append(f"[TOOL] {tool_name} -> {str(result)[:200]}")
+                    except Exception as e:
+                        execution_log.append(f"[TOOL ERROR] {tool_name}: {e}")
+                else:
+                    execution_log.append(f"[TOOL BLOCKED] {tool_name}")
+            elif step.kind == 'subgoal':
+                execution_log.append(f"[SUBGOAL] {step.content}")
+                sub_st
